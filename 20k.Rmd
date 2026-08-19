@@ -1,40 +1,15 @@
----
-title: "20 k"
-author: "ALBERTO SANTI"
-date: "`r Sys.Date()`"
-output: html_document
----
+# =========================================================================
+# Project: Bayesian t-Hidden Markov Model for Financial Risk
+# Description: Implementation of a custom MCMC sampler in NIMBLE to 
+#              estimate regime-switching and forecast VaR/ES on tech stocks.
+# Objective:   Quantitative tail-risk forecasting and market regime detection
+# =========================================================================
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-```
-
-
-```{r}
-
-library(nimble)
-library(coda)
-library(MASS)
-library(mvtnorm)
-library(quantmod)
-library(ggplot2)
-library(tidyr)
-library(dplyr)
-
-get_stock_data <- function(symbols, start_date, end_date) {
-  stock_data <- list()
-  
-  for (symbol in symbols) {
-    tryCatch({
-      data <- getSymbols(symbol, src = "yahoo", 
-                         from = start_date, 
-                         to = end_date, 
-                         auto.assign = FALSE)
-      stock_data[[symbol]] <- Cl(data)  
-    })
-  }
-  return(stock_data)
-}
+# ====================================================================
+# 1. DATA ACQUISITION & PREPROCESSING
+# ====================================================================
+# Fetching market data and computing log-returns to ensure stationarity 
+# before feeding them into the Hidden Markov Model.
 
 symbols <- c("NVDA", "MSFT", "META", "AAPL", "GOOG", "^GSPC", "^NDX")
 start_date <- "2020-01-01"
@@ -47,14 +22,11 @@ log_returns_list <- lapply(stock_prices, function(p) {
 })
 
 log_returns <- do.call(merge, log_returns_list)
-
 colnames(log_returns) <- c("NVIDIA", "MICROSOFT", "META", "APPLE", "GOOGLE", "SEP500", "NASDAQ")
-
 log_returns <- na.omit(log_returns)
 
 dates_clean <- index(log_returns)         
 Y <- coredata(log_returns)                
-
 
 print_descriptive_stats <- function(data) {
   stats <- data.frame(
@@ -71,17 +43,20 @@ print_descriptive_stats <- function(data) {
 
 print(round(print_descriptive_stats(Y), 3))
 
-```
 
-```{r}
-
+# ====================================================================
+# 2. BAYESIAN t-HMM SPECIFICATION (NIMBLE)
+# ====================================================================
+# Defining the hierarchical model. A Student's t-emission distribution 
+# is constructed using a Normal-Inverse-Gamma scale mixture to robustly 
+# capture heavy tails and extreme market events (crashes/rallies).
 
 tHMM_code <- nimbleCode({
   
   # Priors for initial state probabilities
   pi[1:K] ~ ddirch(alpha[1:K])
   
-  # Priors for transition probabilities
+  # Priors for transition probabilities between market regimes
   for(u in 1:K) {
     Pi[u, 1:K] ~ ddirch(alpha[1:K])
   }
@@ -91,44 +66,46 @@ tHMM_code <- nimbleCode({
     mu[u, 1:D] ~ dmnorm(m_prior[1:D], prec = prec_mu[1:D, 1:D])
   }
   
-  # Priors for state-specific precision matrices
+  # Priors for state-specific precision matrices (Wishart)
   for(u in 1:K) {
     Sigma_inv[u, 1:D, 1:D] ~ dwish(R = R_prior[1:D, 1:D], df = alpha_prior)
     Sigma[u, 1:D, 1:D] <- inverse(Sigma_inv[u, 1:D, 1:D])
   }
   
-  # Prior for degrees of freedom
+  # Prior for degrees of freedom (nu controls the heavy-tailedness)
   nu_minus_2 ~ dexp(lambda_prior)
   nu <- nu_minus_2 + 2
   
   U[1] ~ dcat(pi[1:K])
   
+  # Markov chain transitions
   for(t in 2:T) {
     U[t] ~ dcat(Pi[U[t-1], 1:K])
   }
   
-  # Scaling variables 
+  # Scaling variables (Gamma parameters for the t-distribution mixture)
   for(t in 1:T) {
     delta[t] ~ dgamma(shape = nu/2, rate = nu/2)
   }
   
-
+  # Likelihood evaluation
   for(t in 1:T) {
     for(i in 1:D) {
       for(j in 1:D) {
         Prec_scaled[t, i, j] <- delta[t] * Sigma_inv[U[t], i, j]
       }
     }
-    
     Y[t, 1:D] ~ dmnorm(mu[U[t], 1:D], prec = Prec_scaled[t, 1:D, 1:D])
   }
 })
 
-```
 
-
-```{r}
-# Model setup with hyperparameters
+# ====================================================================
+# 3. MODEL INITIALIZATION
+# ====================================================================
+# Using K-means clustering to provide smart initial values to the MCMC.
+# This prevents the chain from getting stuck in local optima and 
+# drastically reduces the required burn-in period.
 
 setup_tHMM <- function(Y, K = 4, lambda = 1) {
   
@@ -150,11 +127,7 @@ setup_tHMM <- function(Y, K = 4, lambda = 1) {
   }
   
   print(S[1:min(5, D), 1:min(5, D)])
-  
   R_prior <- solve(S)
-  
-  # Wilshart matrix (first 5x5)
-  
   print(round(R_prior[1:min(5, D), 1:min(5, D)], 4))
   
   # Prior precision for means
@@ -174,7 +147,7 @@ setup_tHMM <- function(Y, K = 4, lambda = 1) {
   
   data <- list(Y = Y)
   
-  #K-means initialization
+  # K-means initialization
   set.seed(123)
   km <- kmeans(Y, centers = K, nstart = 20)
   U_init <- km$cluster
@@ -194,7 +167,6 @@ setup_tHMM <- function(Y, K = 4, lambda = 1) {
       if(min(eigen_vals) < 0.01) {
         cov_k <- cov_k + diag(0.1, D)
       }
-      
       Sigma_inv_init[k, , ] <- solve(cov_k)
     } else {
       mu_init[k, ] <- colMeans(Y)
@@ -220,19 +192,21 @@ setup_tHMM <- function(Y, K = 4, lambda = 1) {
   ))
 }
 
-```
 
+# ====================================================================
+# 4. CUSTOM MCMC SAMPLER
+# ====================================================================
+# A custom Random Walk Metropolis-Hastings step on a logarithmic scale.
+# Standard samplers often fail to efficiently explore the parameter 
+# space for degrees of freedom (nu); the log-transformation ensures positivity.
 
-```{r}
-
-# Custom sampler for nu 
 sampler_nu_logRW <- nimbleFunction(
     contains = sampler_BASE,
     setup = function(model, mvSaved, target, control) {
     sigma_prop <- 0.5
     calcNodes <- model$getDependencies(target)
     
-    # Likelihood of gamma variables
+    # Likelihood of gamma variables dependent on nu
     delta_nodes <- model$expandNodeNames('delta')
   },
   
@@ -249,17 +223,10 @@ sampler_nu_logRW <- nimbleFunction(
     model_nu <- nu_prop  
     model$calculate('nu')
     
-    # Log acceptance ratio
-    # Prior ratio
+    # Log acceptance ratio (Prior + Likelihood + Jacobian correction)
     logPriorRatio <- model$calculateDiff(target)
-    
-    # Likelihood ratio through delta nodes
     logLikRatio <- model$calculateDiff(delta_nodes)
-    
-    # Jacobian correction for transformation
     logJacobian <- theta_prop - theta_current
-    
-    # Total log acceptance ratio
     logMHR <- logPriorRatio + logLikRatio + logJacobian
     
     accept <- decide(logMHR)
@@ -279,20 +246,15 @@ sampler_nu_logRW <- nimbleFunction(
   )
 )
 
-```
 
-
-```{r}
-
-
-# MCMC with configuration
+# ====================================================================
+# 5. MCMC EXECUTION WRAPPER
+# ====================================================================
 
 run_tHMM_MCMC <- function(Y, K = 4, niter = 20000, nburnin = 2000,
                           thin = 1, nchains = 1, sigma_nu = 0.5,
                           id_constraint = 6) {
   
-  
-
   model_setup <- setup_tHMM(Y, K)
   
   Rmodel <- nimbleModel(
@@ -302,14 +264,12 @@ run_tHMM_MCMC <- function(Y, K = 4, niter = 20000, nburnin = 2000,
     inits = model_setup$inits
   )
   
-  
   Cmodel <- compileNimble(Rmodel)
-  
-
   mcmcConf <- configureMCMC(Rmodel, print = TRUE)
   
   mcmcConf$addMonitors(c('Sigma', 'U', 'delta', 'nu', 'pi'))
   
+  # Inject the custom log-RW sampler for nu
   mcmcConf$removeSamplers('nu_minus_2')
   mcmcConf$addSampler(
     target = 'nu_minus_2',
@@ -317,12 +277,8 @@ run_tHMM_MCMC <- function(Y, K = 4, niter = 20000, nburnin = 2000,
     control = list(sigma = sigma_nu)
   )
   
-  
   Rmcmc <- buildMCMC(mcmcConf)
-  
   Cmcmc <- compileNimble(Rmcmc, project = Rmodel)
-
-  
 
   start_time <- Sys.time()
   
@@ -339,7 +295,6 @@ run_tHMM_MCMC <- function(Y, K = 4, niter = 20000, nburnin = 2000,
   end_time <- Sys.time()
   elapsed <- difftime(end_time, start_time, units = "mins")
   
-  
   return(list(
     samples = samples,
     model = Cmodel,
@@ -351,13 +306,15 @@ run_tHMM_MCMC <- function(Y, K = 4, niter = 20000, nburnin = 2000,
 }
 
 
-```
-
-```{r}
-# Label switching
+# ====================================================================
+# 6. LABEL-SWITCHING CORRECTION
+# ====================================================================
+# Corrects label-switching by ordering states according to the variance 
+# of a specific constraint dimension (e.g., S&P 500 variance).
+# Essential to maintain economic interpretability (e.g., State 1 = Bull Market, 
+# State K = Crisis/High Volatility).
 
 relabel_samples <- function(samples, K, D, constraint_dim = 6) {
-  
   
   if(inherits(samples, "mcmc")) {
     samp_mat <- as.matrix(samples)
@@ -368,7 +325,6 @@ relabel_samples <- function(samples, K, D, constraint_dim = 6) {
   }
   
   n_samples <- nrow(samp_mat)
-  
   Sigma_samples <- array(0, dim = c(n_samples, K, D, D))
   
   for(iter in 1:n_samples) {
@@ -397,6 +353,7 @@ relabel_samples <- function(samples, K, D, constraint_dim = 6) {
     if(!all(ord == 1:K)) {
       n_relabeled <- n_relabeled + 1
       
+      # Reorder Means
       for(k in 1:K) {
         for(d in 1:D) {
           old_col <- paste0("mu[", ord[k], ", ", d, "]")
@@ -407,6 +364,7 @@ relabel_samples <- function(samples, K, D, constraint_dim = 6) {
         }
       }
       
+      # Reorder Covariance and Precision Matrices
       for(k in 1:K) {
         for(i in 1:D) {
           for(j in 1:D) {
@@ -425,6 +383,7 @@ relabel_samples <- function(samples, K, D, constraint_dim = 6) {
         }
       }
       
+      # Reorder Transition Matrix Pi
       for(i in 1:K) {
         for(j in 1:K) {
           old_col <- paste0("Pi[", ord[i], ", ", ord[j], "]")
@@ -435,6 +394,7 @@ relabel_samples <- function(samples, K, D, constraint_dim = 6) {
         }
       }
       
+      # Reorder Initial Probabilities pi
       for(k in 1:K) {
         old_col <- paste0("pi[", ord[k], "]")
         new_col <- paste0("pi[", k, "]")
@@ -443,6 +403,7 @@ relabel_samples <- function(samples, K, D, constraint_dim = 6) {
         }
       }
       
+      # Reorder Hidden States U
       for(t in 1:ncol(relabeled_samp)) {
         if(grepl("^U\\[", colnames(relabeled_samp)[t])) {
           old_state <- samp_mat[iter, t]
@@ -451,25 +412,20 @@ relabel_samples <- function(samples, K, D, constraint_dim = 6) {
         }
       }
     }
-    
-  
   }
   
   cat(sprintf("\n Relabeled %d out of %d iterations (%.1f%%)\n",
               n_relabeled, n_samples, 100*n_relabeled/n_samples))
   
   relabeled_samples <- coda::as.mcmc(relabeled_samp)
-  
   return(relabeled_samples)
 }
 
-```
 
+# ====================================================================
+# 7. POSTERIOR INFERENCE & SUMMARIZATION
+# ====================================================================
 
-```{r}
-
-
-# Posterior estimates extraction
 get_posterior_estimates <- function(samples, K, D, var_names = NULL) {
   
   if(inherits(samples, "mcmc") || inherits(samples, "mcmc.list")) {
@@ -480,6 +436,7 @@ get_posterior_estimates <- function(samples, K, D, var_names = NULL) {
   
   estimates <- list()
   
+  # Posterior Means
   estimates$mu <- matrix(0, K, D)
   for(k in 1:K) {
     for(d in 1:D) {
@@ -489,14 +446,11 @@ get_posterior_estimates <- function(samples, K, D, var_names = NULL) {
       }
     }
   }
-  
-  if(!is.null(var_names)) {
-    colnames(estimates$mu) <- var_names
-  }
+  if(!is.null(var_names)) colnames(estimates$mu) <- var_names
   rownames(estimates$mu) <- paste0("State", 1:K)
   
+  # Posterior Covariances
   estimates$Sigma <- array(0, dim = c(K, D, D))
-  
   for(k in 1:K) {
     for(i in 1:D) {
       for(j in 1:D) {
@@ -506,13 +460,13 @@ get_posterior_estimates <- function(samples, K, D, var_names = NULL) {
         }
       }
     }
-    
     if(!is.null(var_names)) {
       dimnames(estimates$Sigma)[[2]] <- var_names
       dimnames(estimates$Sigma)[[3]] <- var_names
     }
   }
   
+  # Posterior Transition Probabilities
   estimates$Pi <- matrix(0, K, K)
   for(i in 1:K) {
     for(j in 1:K) {
@@ -525,11 +479,13 @@ get_posterior_estimates <- function(samples, K, D, var_names = NULL) {
   rownames(estimates$Pi) <- paste0("From", 1:K)
   colnames(estimates$Pi) <- paste0("To", 1:K)
   
+  # Posterior Degrees of Freedom
   if("nu" %in% colnames(samp_mat)) {
     estimates$nu <- mean(samp_mat[, "nu"])
     estimates$nu_sd <- sd(samp_mat[, "nu"])
   }
   
+  # Posterior Initial Probabilities
   estimates$pi <- numeric(K)
   for(k in 1:K) {
     col_name <- paste0("pi[", k, "]")
@@ -539,9 +495,9 @@ get_posterior_estimates <- function(samples, K, D, var_names = NULL) {
   }
   names(estimates$pi) <- paste0("State", 1:K)
   
+  # Posterior State Extraction (Mode)
   T <- sum(grepl("^U\\[", colnames(samp_mat)))
   estimates$U <- numeric(T)
-  
   for(t in 1:T) {
     u_col <- paste0("U[", t, "]")
     if(u_col %in% colnames(samp_mat)) {
@@ -553,34 +509,23 @@ get_posterior_estimates <- function(samples, K, D, var_names = NULL) {
   return(estimates)
 }
 
-
-```
-
-
-```{r}
-
 print_results <- function(estimates, K, var_names) {
   
   print(round(estimates$mu, 3))
-  
   for(k in 1:K) {
     variances <- diag(estimates$Sigma[k, , ])
     names(variances) <- var_names
     cat(sprintf("State %d:\n", k))
     print(round(variances, 3))
   }
-  
   for(k in 1:K) {
     cat(sprintf("\nState %d:\n", k))
     print(round(estimates$Sigma[k, , ], 3))
   }
   
   print(round(estimates$Pi, 3))
-  
   cat(sprintf("nu = %.3f (SD = %.3f)\n", estimates$nu, estimates$nu_sd))
-  
   print(round(estimates$pi, 3))
-  
   print(table(factor(estimates$U, levels = 1:K)))
   
   for(k in 1:K) {
@@ -600,11 +545,12 @@ print_results <- function(estimates, K, var_names) {
 }
 
 
-```
-
-
-
-```{r}
+# ====================================================================
+# 8. QUANTITATIVE RISK FORECASTING (VaR & ES)
+# ====================================================================
+# Monte Carlo simulation of future return paths based on MCMC posterior draws.
+# This explicitly computes Value at Risk (VaR) and Expected Shortfall (ES) 
+# for risk management operations.
 
 forecast_tHMM <- function(mcmc_output, h = 10, n_samples = 1000) {
   
@@ -628,7 +574,6 @@ forecast_tHMM <- function(mcmc_output, h = 10, n_samples = 1000) {
   U_forecast <- matrix(NA, n_samples, h)
   delta_forecast <- matrix(NA, n_samples, h)
   
-  
   for(s in 1:n_samples) {
     state_obs <- sample_state_obs[s]
     
@@ -640,11 +585,9 @@ forecast_tHMM <- function(mcmc_output, h = 10, n_samples = 1000) {
       for(d in 1:D) {
         mu[k, d] <- samp_mat[state_obs, paste0("mu[", k, ", ", d, "]")]
       }
-      
       for(i in 1:K) {
         Pi[k, i] <- samp_mat[state_obs, paste0("Pi[", k, ", ", i, "]")]
       }
-      
       for(i in 1:D) {
         for(j in 1:D) {
           Sigma[k, i, j] <- samp_mat[state_obs, paste0("Sigma[", k, ", ", i, ", ", j, "]")]
@@ -660,6 +603,7 @@ forecast_tHMM <- function(mcmc_output, h = 10, n_samples = 1000) {
     
     U_current <- samp_mat[state_obs, paste0("U[", T_obs, "]")]
     
+    # Simulating future paths
     for(t_ahead in 1:h) {
       U_next <- sample(1:K, size = 1, prob = Pi[U_current, ])
       U_forecast[s, t_ahead] <- U_next
@@ -674,15 +618,10 @@ forecast_tHMM <- function(mcmc_output, h = 10, n_samples = 1000) {
         Sigma_scaled <- Sigma_scaled + diag(1e-6, D)
       }
       
-      Y_forecast[s, t_ahead, ] <- mvrnorm(n = 1,
-                                          mu = mu[U_next, ],
-                                          Sigma = Sigma_scaled)
-      
+      Y_forecast[s, t_ahead, ] <- mvrnorm(n = 1, mu = mu[U_next, ], Sigma = Sigma_scaled)
       U_current <- U_next
     }
-    
   }
-  
   
   return(list(
     Y_forecast = Y_forecast,
@@ -728,22 +667,16 @@ summarize_forecasts <- function(forecast_result) {
   ))
 }
 
-
-```
-
-
-
-```{r}
-
 compute_risk_measures <- function(forecast_result, variable_index = 1, alpha = 0.05) {
   
   h <- forecast_result$h
   Y_forecast <- forecast_result$Y_forecast[, , variable_index]
   var_name <- forecast_result$variable_names[variable_index]
   
-  
+  # Value at Risk (VaR) calculation
   VaR <- apply(Y_forecast, 1, quantile, probs = alpha)
   
+  # Expected Shortfall (ES) calculation
   ES <- sapply(1:h, function(t) {
     forecasts_t <- Y_forecast[, t]
     mean(forecasts_t[forecasts_t <= VaR[t]])
@@ -756,9 +689,13 @@ compute_risk_measures <- function(forecast_result, variable_index = 1, alpha = 0
   )
   
   print(risk_table)
-  
   return(list(VaR = VaR, ES = ES))
 }
+
+
+# ====================================================================
+# PLOTTING UTILITIES
+# ====================================================================
 
 plot_state_allocation <- function(Y, estimates, dates = NULL, main_title = NULL) {
   
@@ -773,7 +710,6 @@ plot_state_allocation <- function(Y, estimates, dates = NULL, main_title = NULL)
     }
     Time_vec <- dates
   }
-
   
   plot_data <- data.frame(
     Time = rep(Time_vec, D),
@@ -826,11 +762,11 @@ plot_forecast_density <- function(forecast_result, variable_index = 1,
   return(p)
 }
 
-```
 
-
-
-```{r}
+# ====================================================================
+# 9. MAIN EXECUTION SCRIPT
+# ====================================================================
+# Running the complete pipeline: MCMC -> Relabeling -> Metrics -> Risk
 
 K <- 4
 niter <- 20000  
@@ -839,6 +775,7 @@ thin <- 5
 sigma_nu <- 0.5
 id_constraint <- 6
 
+# Execute MCMC
 mcmc_output <- run_tHMM_MCMC(
   Y = Y,
   K = K,
@@ -850,7 +787,7 @@ mcmc_output <- run_tHMM_MCMC(
   id_constraint = id_constraint
 )
 
-
+# Apply constraint to solve label-switching
 relabeled_samples <- relabel_samples(
   samples = mcmc_output$samples,
   K = K,
@@ -858,6 +795,7 @@ relabeled_samples <- relabel_samples(
   constraint_dim = id_constraint
 )
 
+# Extract Estimates
 estimates <- get_posterior_estimates(
   samples = relabeled_samples,
   K = K,
@@ -867,22 +805,15 @@ estimates <- get_posterior_estimates(
 
 print_results(estimates, K, colnames(Y))
 
-
+# Effective Sample Size Diagnostics
 ess <- effectiveSize(relabeled_samples)
-
-
-# mu (first 12)
-
 mu_ess <- ess[grepl("^mu\\[", names(ess))]
 mu_ess_matrix <- matrix(mu_ess, nrow = 4, ncol = 7, byrow = TRUE)
 rownames(mu_ess_matrix) <- paste0("State ", 1:4)
 colnames(mu_ess_matrix) <- c("NVDA", "MSFT", "META", "AAPL", "GOOG", "SP500", "NDX")
 print(round(mu_ess_matrix, 2))
 
-#samp_mat <- as.matrix(relabeled_samples)
-
 ess_trimm <- function(samples_mcmc, drop_frac=0.10){
-  
   mat <- as.matrix(samples_mcmc) 
   n <- nrow(mat)
   start <- floor(n*drop_frac)+1 
@@ -891,11 +822,9 @@ ess_trimm <- function(samples_mcmc, drop_frac=0.10){
 } 
 
 ess_10 <- ess_trimm(relabeled_samples, drop_frac = 0.10) 
-
 ess_25 <- ess_trimm(relabeled_samples, drop_frac = 0.25)
 
 mu_ess_10 <- ess_10[grepl("^mu\\[", names(ess_10))]
-
 mu_ess_25 <- ess_25[grepl("^mu\\[", names(ess_25))]
 
 mu_ess_10_matrix <- matrix(mu_ess_10, nrow = 4, ncol = 7, byrow = TRUE)
@@ -905,11 +834,9 @@ rownames(mu_ess_10_matrix) <- rownames(mu_ess_25_matrix) <- paste0("State ", 1:4
 colnames(mu_ess_10_matrix) <- colnames(mu_ess_25_matrix) <- c("NVDA", "MSFT", "META", "AAPL", "GOOG", "SP500", "NDX")
 
 print(round(mu_ess_10_matrix, 2))
-
 print(round(mu_ess_25_matrix, 2))
 
 traceplot_trimmed_mu <- function(samples_mcmc, drop_frac = 0.10, n_plot = 28, main_title = NULL) {  
-  
   mat <- as.matrix(samples_mcmc)
   n <- nrow(mat) 
   start <- floor(n * drop_frac) + 1 
@@ -946,20 +873,15 @@ traceplot_trimmed_mu(
   main_title = "Traceplots mu - drop 25%"
 )
 
-
-# Pi parameters (first 16)
-
 pi_ess <- ess[grepl("^Pi\\[", names(ess))]
 print(head(pi_ess, 16))
 
 cat("\n  nu:", ess["nu"], "\n")
 
-# Sigma parameters (first 12)
-
 sigma_ess <- ess[grepl("^Sigma\\[", names(ess))]
 print(head(sigma_ess, 12))
 
-# Plot state allocation 
+# Generate allocations plot
 p_states <- plot_state_allocation(
   Y, 
   estimates,
@@ -970,30 +892,23 @@ print(p_states)
 
 mcmc_output$samples <- relabeled_samples
 
+# Execute Forecasting
 forecasts <- forecast_tHMM(mcmc_output, h = 10, n_samples = 500)
 forecast_summary <- summarize_forecasts(forecasts)
 
-
 print(round(forecast_summary$mean, 3))
-
 print(round(forecast_summary$sd, 3))
-
-# Forecast 95% HPR (Lower)
 print(round(forecast_summary$lower_95, 3))
-
-# Forecast 95% HPR (Upper)
 print(round(forecast_summary$upper_95, 3))
 
-# Risk measures for each stock
+# Risk Metrics evaluation
 for(i in 1:ncol(Y)) {
   risk_measures <- compute_risk_measures(forecasts, variable_index = i, alpha = 0.05)
 }
 
-# Plot forecast density for each stock 
 p_forecast <- plot_forecast_density(forecasts, variable_index = 1,
                                     horizons = c(1, 5, 10))
 print(p_forecast)
-
 
 forecast_table_stocks <- function(forecast_summary, variable_index, variable_name, h = 10) {
   
@@ -1014,20 +929,13 @@ forecast_table_stocks <- function(forecast_summary, variable_index, variable_nam
   return(forecast_table)
 }
 
-forecasts <- forecast_tHMM(mcmc_output, h = 10, n_samples = 500)
-forecast_summary <- summarize_forecasts(forecasts)
-
+# Generate final tables
 stock_names <- colnames(Y)
 
 for(i in 1:ncol(Y)) {
-
   table_i <- forecast_table_stocks(forecast_summary, 
                                    variable_index = i, 
                                    variable_name = stock_names[i],
                                    h = 10)
   print(table_i, row.names = FALSE)
 }
-
-
-```
-
